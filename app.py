@@ -1,702 +1,571 @@
-# app_cbl_visualizador.py
-# Visualizador CBL para archivos .LAS, .CSV y .XLSX
-# Autor: ChatGPT
-# Uso:
-#   pip install -r requirements_cbl_visualizador.txt
-#   streamlit run app_cbl_visualizador.py
-
 import io
 import re
-from typing import Optional, Tuple, List
+import zipfile
+from pathlib import Path
 
+import lasio
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
 
-try:
-    import lasio
-except ImportError:
-    lasio = None
-
-
-# =========================================================
-# CONFIGURACION GENERAL
-# =========================================================
 st.set_page_config(
-    page_title="Visualizador CBL - Registro de Cemento",
+    page_title="Visualizador CBL 3D",
     page_icon="🛢️",
     layout="wide",
 )
 
+# ------------------------------------------------------------
+# Utilidades de lectura
+# ------------------------------------------------------------
 
-# =========================================================
-# FUNCIONES DE LECTURA
-# =========================================================
-def clean_column_name(col) -> str:
-    """Normaliza nombres de columnas para facilitar deteccion."""
-    col = str(col).strip()
-    col = re.sub(r"\s+", "_", col)
-    return col
+def normalize_name(name: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
 
 
-def read_las_file(uploaded_file) -> pd.DataFrame:
-    """Lee un archivo LAS y devuelve un DataFrame."""
-    if lasio is None:
-        raise ImportError("Falta instalar lasio. Ejecuta: pip install lasio")
+def load_file(uploaded_file) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix.lower()
 
-    raw = uploaded_file.read()
+    if suffix == ".las":
+        raw = uploaded_file.getvalue()
+        text = raw.decode("utf-8", errors="ignore")
+        las = lasio.read(io.StringIO(text))
+        df = las.df().reset_index()
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
 
-    # Intentos comunes de decodificacion
-    text = None
-    for enc in ["utf-8", "latin-1", "cp1252"]:
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
+    if suffix in [".xlsx", ".xls"]:
+        return pd.read_excel(uploaded_file)
 
-    if text is None:
-        raise ValueError("No se pudo decodificar el archivo LAS.")
+    if suffix == ".csv":
+        raw = uploaded_file.getvalue()
+        text = raw.decode("utf-8", errors="ignore")
+        return pd.read_csv(io.StringIO(text), sep=None, engine="python")
 
-    las = lasio.read(io.StringIO(text))
-    df = las.df().reset_index()
-
-    # Renombrar la primera columna como la primera curva del LAS si aplica
-    if len(las.curves) > 0:
-        first_curve = las.curves[0].mnemonic
-        if df.columns[0].lower() in ["index", "dept", "depth"]:
-            df = df.rename(columns={df.columns[0]: first_curve})
-
-    df.columns = [clean_column_name(c) for c in df.columns]
-    df = df.replace([-999.25, -999.0, -9999, -9999.0], np.nan)
-    return df
+    raise ValueError("Formato no soportado. Usa LAS, CSV, XLSX o XLS.")
 
 
-def read_csv_file(uploaded_file) -> pd.DataFrame:
-    """Lee CSV intentando detectar separador."""
-    raw = uploaded_file.read()
-    text = None
-    for enc in ["utf-8", "latin-1", "cp1252"]:
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-
-    if text is None:
-        raise ValueError("No se pudo decodificar el CSV.")
-
-    # sep=None intenta inferir coma, punto y coma, tab, etc.
-    df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
-    df.columns = [clean_column_name(c) for c in df.columns]
-    return df
+def guess_depth_column(df: pd.DataFrame):
+    preferred = ["DEPT", "DEPTH", "MD", "TVD", "PROFUNDIDAD", "PROF"]
+    normalized = {col: normalize_name(col) for col in df.columns}
+    for key in preferred:
+        for col, ncol in normalized.items():
+            if key == ncol or key in ncol:
+                return col
+    return df.columns[0]
 
 
-def read_excel_file(uploaded_file) -> pd.DataFrame:
-    """Lee Excel. Por defecto toma la primera hoja."""
-    df = pd.read_excel(uploaded_file)
-    df.columns = [clean_column_name(c) for c in df.columns]
-    return df
+def guess_cbl_column(df: pd.DataFrame):
+    preferred_exact = ["AMP3FT", "CBL", "CBL3FT", "AMPLITUDE", "AMPLITUD", "AMP"]
+    normalized = {col: normalize_name(col) for col in df.columns}
+
+    for key in preferred_exact:
+        for col, ncol in normalized.items():
+            if key == ncol:
+                return col
+
+    for key in ["AMP3", "CBL", "AMPL", "AMP"]:
+        for col, ncol in normalized.items():
+            if key in ncol:
+                return col
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    return numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
 
 
-def load_uploaded_file(uploaded_file) -> pd.DataFrame:
-    """Carga archivo segun extension."""
-    filename = uploaded_file.name.lower()
-
-    if filename.endswith(".las"):
-        return read_las_file(uploaded_file)
-    if filename.endswith(".csv"):
-        return read_csv_file(uploaded_file)
-    if filename.endswith(".xlsx") or filename.endswith(".xls"):
-        return read_excel_file(uploaded_file)
-
-    raise ValueError("Formato no soportado. Usa .las, .csv, .xlsx o .xls")
-
-
-# =========================================================
-# DETECCION AUTOMATICA DE COLUMNAS
-# =========================================================
-def find_first_matching_column(columns: List[str], patterns: List[str]) -> Optional[str]:
-    """Busca la primera columna que contenga alguno de los patrones."""
-    upper_cols = {c: c.upper() for c in columns}
-    for pattern in patterns:
-        pattern = pattern.upper()
-        for original, upper in upper_cols.items():
-            if pattern in upper:
-                return original
+def find_optional_column(df: pd.DataFrame, keys):
+    normalized = {col: normalize_name(col) for col in df.columns}
+    for key in keys:
+        for col, ncol in normalized.items():
+            if normalize_name(key) == ncol or normalize_name(key) in ncol:
+                return col
     return None
 
 
-def detect_columns(df: pd.DataFrame) -> dict:
-    """Detecta columnas tipicas para CBL."""
-    columns = list(df.columns)
+def clean_data(df: pd.DataFrame, depth_col: str, cbl_col: str, gr_col=None, ccl_col=None, tt_col=None):
+    cols = [depth_col, cbl_col]
+    for col in [gr_col, ccl_col, tt_col]:
+        if col and col not in cols:
+            cols.append(col)
 
-    depth_col = find_first_matching_column(
-        columns,
-        ["DEPTH", "DEPT", "MD", "TVD", "PROF", "PROFUNDIDAD"]
-    )
+    out = df[cols].copy()
+    rename = {depth_col: "DEPTH", cbl_col: "CBL"}
+    if gr_col:
+        rename[gr_col] = "GR"
+    if ccl_col:
+        rename[ccl_col] = "CCL"
+    if tt_col:
+        rename[tt_col] = "TT"
+    out = out.rename(columns=rename)
 
-    amp3_col = find_first_matching_column(
-        columns,
-        ["AMP3FT", "AMP_3FT", "CBL", "AMP", "AMPLITUDE", "AMPLITUD"]
-    )
+    for col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    amp5_col = find_first_matching_column(
-        columns,
-        ["AMP5FT", "AMP_5FT"]
-    )
-
-    gr_col = find_first_matching_column(
-        columns,
-        ["GR", "GK", "GAMMA"]
-    )
-
-    tt_col = find_first_matching_column(
-        columns,
-        ["TT3FT", "TT", "TRAVEL"]
-    )
-
-    ccl_col = find_first_matching_column(
-        columns,
-        ["CCL", "COLLAR"]
-    )
-
-    return {
-        "depth": depth_col,
-        "amp3": amp3_col,
-        "amp5": amp5_col,
-        "gr": gr_col,
-        "tt": tt_col,
-        "ccl": ccl_col,
-    }
-
-
-# =========================================================
-# PROCESAMIENTO CBL
-# =========================================================
-def to_numeric_series(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
-
-
-def classify_cbl_value(value: float, good_max: float, regular_max: float,
-                       alert_max: float, bad_min: float, critical_min: float) -> str:
-    """Clasificacion cualitativa por amplitud CBL."""
-    if pd.isna(value):
-        return "Sin dato"
-    if value >= critical_min:
-        return "Critico"
-    if value >= bad_min:
-        return "Mala adherencia"
-    if value > regular_max and value < bad_min:
-        return "Alerta"
-    if value > good_max and value <= regular_max:
-        return "Regular"
-    return "Bueno"
-
-
-def prepare_cbl_dataframe(df: pd.DataFrame, depth_col: str, cbl_col: str,
-                          good_max: float, regular_max: float,
-                          alert_max: float, bad_min: float,
-                          critical_min: float) -> pd.DataFrame:
-    """Limpia y clasifica el DataFrame para el analisis CBL."""
-    out = df.copy()
-    out[depth_col] = to_numeric_series(out[depth_col])
-    out[cbl_col] = to_numeric_series(out[cbl_col])
-    out = out.dropna(subset=[depth_col, cbl_col]).sort_values(depth_col).reset_index(drop=True)
-
-    out["CBL_clasificacion"] = out[cbl_col].apply(
-        lambda x: classify_cbl_value(x, good_max, regular_max, alert_max, bad_min, critical_min)
-    )
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.dropna(subset=["DEPTH", "CBL"])
+    out = out.sort_values("DEPTH").drop_duplicates(subset=["DEPTH"])
+    out = out.reset_index(drop=True)
     return out
 
 
-def estimate_depth_step(depth: pd.Series) -> float:
-    diffs = depth.diff().abs().dropna()
-    diffs = diffs[diffs > 0]
-    if len(diffs) == 0:
-        return 0.5
-    return float(diffs.median())
+# ------------------------------------------------------------
+# Interpretación
+# ------------------------------------------------------------
+
+def classify_cbl(value, good_lim, regular_lim, bad_lim, critical_lim):
+    if value <= good_lim:
+        return "Bueno"
+    if value <= regular_lim:
+        return "Regular"
+    if value < bad_lim:
+        return "Alerta"
+    if value < critical_lim:
+        return "Mala adherencia"
+    return "Crítico"
 
 
-def find_bad_bond_intervals(df: pd.DataFrame, depth_col: str, cbl_col: str,
-                            threshold: float, min_length_ft: float) -> pd.DataFrame:
-    """Encuentra intervalos continuos donde CBL supera el umbral indicado."""
+def severity_from_cbl(cbl, bad_lim, critical_lim):
+    sev = (cbl - bad_lim) / max(critical_lim - bad_lim, 0.001)
+    return np.clip(sev, 0, 1)
+
+
+def detect_intervals(df: pd.DataFrame, limit: float, min_len_ft: float):
     if df.empty:
         return pd.DataFrame()
 
-    data = df[[depth_col, cbl_col]].dropna().sort_values(depth_col).reset_index(drop=True)
-    step = estimate_depth_step(data[depth_col])
-    max_gap = max(step * 2.5, 0.75)
+    work = df[["DEPTH", "CBL", "CLASS"]].copy()
+    work["flag"] = work["CBL"] >= limit
 
-    intervals = []
-    in_interval = False
-    start_depth = None
-    values = []
-    last_depth = None
+    if len(work) > 1:
+        sample_step = float(np.nanmedian(np.abs(np.diff(work["DEPTH"]))))
+        if not np.isfinite(sample_step) or sample_step <= 0:
+            sample_step = 0.5
+    else:
+        sample_step = 0.5
 
-    for _, row in data.iterrows():
-        depth = float(row[depth_col])
-        amp = float(row[cbl_col])
-        is_bad = amp >= threshold
+    max_gap = max(sample_step * 2.5, 1.0)
+    groups = []
+    active = False
+    start_idx = None
+    prev_depth = None
 
-        # Si hay salto fuerte en profundidad, cerrar intervalo previo
-        if in_interval and last_depth is not None and abs(depth - last_depth) > max_gap:
-            end_depth = last_depth
-            length = abs(end_depth - start_depth)
-            if length >= min_length_ft:
-                intervals.append({
-                    "Desde_ft": min(start_depth, end_depth),
-                    "Hasta_ft": max(start_depth, end_depth),
-                    "Longitud_ft": length,
-                    "CBL_max_mV": np.nanmax(values),
-                    "CBL_prom_mV": np.nanmean(values),
-                    "N_puntos": len(values),
-                })
-            in_interval = False
-            start_depth = None
-            values = []
+    for idx, row in work.iterrows():
+        depth = float(row["DEPTH"])
+        flag = bool(row["flag"])
 
-        if is_bad:
-            if not in_interval:
-                in_interval = True
-                start_depth = depth
-                values = [amp]
-            else:
-                values.append(amp)
-        else:
-            if in_interval:
-                end_depth = last_depth if last_depth is not None else depth
-                length = abs(end_depth - start_depth)
-                if length >= min_length_ft:
-                    intervals.append({
-                        "Desde_ft": min(start_depth, end_depth),
-                        "Hasta_ft": max(start_depth, end_depth),
-                        "Longitud_ft": length,
-                        "CBL_max_mV": np.nanmax(values),
-                        "CBL_prom_mV": np.nanmean(values),
-                        "N_puntos": len(values),
-                    })
-                in_interval = False
-                start_depth = None
-                values = []
+        if flag and not active:
+            active = True
+            start_idx = idx
+        elif flag and active and prev_depth is not None and abs(depth - prev_depth) > max_gap:
+            groups.append((start_idx, idx - 1))
+            start_idx = idx
+        elif not flag and active:
+            groups.append((start_idx, idx - 1))
+            active = False
+            start_idx = None
 
-        last_depth = depth
+        if flag:
+            prev_depth = depth
 
-    # Cerrar intervalo al final
-    if in_interval and start_depth is not None and last_depth is not None:
-        end_depth = last_depth
-        length = abs(end_depth - start_depth)
-        if length >= min_length_ft:
-            intervals.append({
-                "Desde_ft": min(start_depth, end_depth),
-                "Hasta_ft": max(start_depth, end_depth),
-                "Longitud_ft": length,
-                "CBL_max_mV": np.nanmax(values),
-                "CBL_prom_mV": np.nanmean(values),
-                "N_puntos": len(values),
-            })
+    if active and start_idx is not None:
+        groups.append((start_idx, len(work) - 1))
 
-    result = pd.DataFrame(intervals)
-    if not result.empty:
-        result = result.sort_values(["CBL_max_mV", "Longitud_ft"], ascending=[False, False]).reset_index(drop=True)
-    return result
+    rows = []
+    for start_idx, end_idx in groups:
+        block = work.iloc[start_idx:end_idx + 1]
+        start = float(block["DEPTH"].min())
+        end = float(block["DEPTH"].max())
+        length = abs(end - start)
+        max_amp = float(block["CBL"].max())
+        mean_amp = float(block["CBL"].mean())
+        rows.append({
+            "Desde_ft": round(start, 2),
+            "Hasta_ft": round(end, 2),
+            "Longitud_ft": round(length, 2),
+            "CBL_max_mV": round(max_amp, 2),
+            "CBL_prom_mV": round(mean_amp, 2),
+            "Condición": "Operativo" if length >= min_len_ft else "Evento corto",
+            "Interpretación": classify_cbl(max_amp, 3, 8, 10, 15),
+        })
+
+    return pd.DataFrame(rows)
 
 
-# =========================================================
-# GRAFICAS
-# =========================================================
-def make_2d_tracks(df: pd.DataFrame, depth_col: str, cbl_col: str,
-                   gr_col: Optional[str], amp5_col: Optional[str],
-                   tt_col: Optional[str], ccl_col: Optional[str],
-                   bad_min: float, critical_min: float):
-    """Genera tracks 2D similares a un registro de pozo."""
-    tracks = []
+# ------------------------------------------------------------
+# Gráficos
+# ------------------------------------------------------------
 
-    if gr_col and gr_col in df.columns:
-        tracks.append((gr_col, "GR / GK"))
+def make_log_plot(df, good_lim, regular_lim, bad_lim, critical_lim):
+    has_gr = "GR" in df.columns
+    has_ccl = "CCL" in df.columns
+    has_tt = "TT" in df.columns
 
-    tracks.append((cbl_col, "CBL principal"))
+    titles = []
+    if has_gr:
+        titles.append("GR")
+    titles.append("CBL amplitud")
+    if has_tt:
+        titles.append("TT")
+    if has_ccl:
+        titles.append("CCL")
 
-    if amp5_col and amp5_col in df.columns and amp5_col != cbl_col:
-        tracks.append((amp5_col, "AMP 5FT"))
+    fig = make_subplots(rows=1, cols=len(titles), shared_yaxes=True, horizontal_spacing=0.03, subplot_titles=titles)
+    col = 1
 
-    if tt_col and tt_col in df.columns:
-        tracks.append((tt_col, "Travel Time"))
+    if has_gr:
+        fig.add_trace(go.Scatter(x=df["GR"], y=df["DEPTH"], mode="lines", name="GR"), row=1, col=col)
+        fig.update_xaxes(title_text="GR", row=1, col=col)
+        col += 1
 
-    if ccl_col and ccl_col in df.columns:
-        tracks.append((ccl_col, "CCL"))
+    fig.add_trace(go.Scatter(x=df["CBL"], y=df["DEPTH"], mode="lines", name="CBL mV"), row=1, col=col)
+    for x, label in [(good_lim, "Bueno"), (regular_lim, "Regular"), (bad_lim, "Mala adherencia"), (critical_lim, "Crítico")]:
+        fig.add_vline(x=x, line_width=1, line_dash="dash", annotation_text=label, row=1, col=col)
+    fig.update_xaxes(title_text="mV", row=1, col=col)
+    col += 1
 
-    fig = make_subplots(
-        rows=1,
-        cols=len(tracks),
-        shared_yaxes=True,
-        horizontal_spacing=0.025,
-        subplot_titles=[t[1] for t in tracks],
-    )
+    if has_tt:
+        fig.add_trace(go.Scatter(x=df["TT"], y=df["DEPTH"], mode="lines", name="TT"), row=1, col=col)
+        fig.update_xaxes(title_text="TT", row=1, col=col)
+        col += 1
 
-    for idx, (col, name) in enumerate(tracks, start=1):
-        y = df[depth_col]
-        x = pd.to_numeric(df[col], errors="coerce")
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=y,
-                mode="lines",
-                name=name,
-                hovertemplate=f"{col}: %{{x}}<br>Profundidad: %{{y}} ft<extra></extra>",
-            ),
-            row=1,
-            col=idx,
-        )
+    if has_ccl:
+        fig.add_trace(go.Scatter(x=df["CCL"], y=df["DEPTH"], mode="lines", name="CCL"), row=1, col=col)
+        fig.update_xaxes(title_text="CCL", row=1, col=col)
 
-        if col == cbl_col:
-            fig.add_vline(x=bad_min, line_dash="dash", annotation_text="Mala", row=1, col=idx)
-            fig.add_vline(x=critical_min, line_dash="dot", annotation_text="Crítico", row=1, col=idx)
-
-    fig.update_yaxes(title_text="Profundidad, ft", autorange="reversed", row=1, col=1)
-    fig.update_layout(
-        height=820,
-        title="Registro CBL / Cemento - Vista 2D",
-        showlegend=False,
-        margin=dict(l=20, r=20, t=80, b=20),
-    )
+    fig.update_yaxes(autorange="reversed", title_text="Profundidad, ft")
+    fig.update_layout(height=750, showlegend=False, margin=dict(l=20, r=20, t=60, b=20))
     return fig
 
 
-def make_cbl_3d_cylinder(df: pd.DataFrame, depth_col: str, cbl_col: str,
-                         bad_min: float, critical_min: float,
-                         max_points: int = 1500):
-    """Genera vista pseudo 3D como cilindro coloreado por amplitud CBL."""
-    data = df[[depth_col, cbl_col]].dropna().sort_values(depth_col).copy()
+def make_2d_schematic(df, good_lim, regular_lim, bad_lim, critical_lim):
+    plot_df = df.copy()
+    plot_df["SEV"] = severity_from_cbl(plot_df["CBL"], bad_lim, critical_lim)
 
-    # Reducir puntos si el archivo es muy grande
-    if len(data) > max_points:
-        data = data.iloc[np.linspace(0, len(data) - 1, max_points).astype(int)]
+    z = plot_df["DEPTH"].to_numpy()
+    sev = plot_df["SEV"].to_numpy()
+    cbl = plot_df["CBL"].to_numpy()
 
-    depth = data[depth_col].to_numpy(dtype=float)
-    amp = data[cbl_col].to_numpy(dtype=float)
+    # Matriz lateral: izquierda y derecha representan el anular esquemático.
+    x = np.linspace(-1.4, 1.4, 80)
+    image = np.zeros((len(z), len(x)))
 
-    theta = np.linspace(0, 2 * np.pi, 48)
+    for i, s in enumerate(sev):
+        for j, xx in enumerate(x):
+            in_casing = abs(xx) <= 0.34
+            annulus = 0.34 < abs(xx) <= 1.00
+            formation = abs(xx) > 1.00
 
-    # Radio base del casing. Se deforma levemente con amplitud solo para visualizar severidad.
-    amp_min = np.nanmin(amp)
-    amp_max = np.nanmax(amp)
-    denom = amp_max - amp_min if amp_max != amp_min else 1.0
-    amp_norm = (amp - amp_min) / denom
-    radius = 1.0 + 0.20 * amp_norm
+            if in_casing:
+                image[i, j] = -0.25
+            elif annulus:
+                image[i, j] = s
+            elif formation:
+                image[i, j] = -0.55
 
-    R = np.outer(radius, np.ones_like(theta))
-    X = R * np.cos(theta)
-    Y = R * np.sin(theta)
-    Z = np.outer(depth, np.ones_like(theta))
-    C = np.outer(amp, np.ones_like(theta))
+    colorscale = [
+        [0.00, "#f1f1f1"],
+        [0.20, "#f1f1f1"],
+        [0.21, "#666666"],
+        [0.32, "#666666"],
+        [0.33, "#1f78b4"],
+        [0.48, "#35a853"],
+        [0.65, "#f2c94c"],
+        [0.82, "#f2994a"],
+        [1.00, "#d7191c"],
+    ]
 
-    fig = go.Figure(
-        data=[
-            go.Surface(
-                x=X,
-                y=Y,
-                z=Z,
-                surfacecolor=C,
-                colorscale="Turbo",
-                colorbar=dict(title=f"{cbl_col}, mV"),
-                hovertemplate=(
-                    "Profundidad: %{z:.2f} ft<br>"
-                    f"{cbl_col}: %{{surfacecolor:.2f}} mV<extra></extra>"
-                ),
-            )
-        ]
-    )
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.55, 0.45], shared_yaxes=True,
+                        horizontal_spacing=0.02, subplot_titles=["Esquema casing cemento formación", "Curva CBL"])
 
-    fig.update_layout(
-        title="Vista pseudo 3D del CBL: severidad de adherencia alrededor del casing",
-        height=850,
-        scene=dict(
-            xaxis=dict(title="X", showticklabels=False),
-            yaxis=dict(title="Y", showticklabels=False),
-            zaxis=dict(title="Profundidad, ft", autorange="reversed"),
-            aspectmode="manual",
-            aspectratio=dict(x=1, y=1, z=3.3),
-        ),
-        margin=dict(l=10, r=10, t=70, b=10),
-    )
+    # Reescalado para color porque image tiene valores negativos.
+    color_data = (image + 0.55) / 1.55
+    fig.add_trace(go.Heatmap(
+        x=x,
+        y=z,
+        z=color_data,
+        colorscale=colorscale,
+        showscale=False,
+        hovertemplate="Profundidad: %{y:.2f} ft<br>Severidad relativa: %{z:.2f}<extra></extra>",
+    ), row=1, col=1)
 
+    fig.add_vline(x=-0.34, line_width=3, line_color="black", row=1, col=1)
+    fig.add_vline(x=0.34, line_width=3, line_color="black", row=1, col=1)
+    fig.add_vline(x=-1.00, line_width=1, line_dash="dot", line_color="gray", row=1, col=1)
+    fig.add_vline(x=1.00, line_width=1, line_dash="dot", line_color="gray", row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=cbl, y=z, mode="lines", name="CBL"), row=1, col=2)
+    for xline, label in [(good_lim, "Bueno"), (regular_lim, "Regular"), (bad_lim, "Mala adherencia"), (critical_lim, "Crítico")]:
+        fig.add_vline(x=xline, line_width=1, line_dash="dash", annotation_text=label, row=1, col=2)
+
+    fig.update_yaxes(autorange="reversed", title_text="Profundidad, ft")
+    fig.update_xaxes(showticklabels=False, row=1, col=1)
+    fig.update_xaxes(title_text="CBL, mV", row=1, col=2)
+    fig.update_layout(height=850, margin=dict(l=20, r=20, t=70, b=20), showlegend=False)
     return fig
 
 
-def make_class_distribution(df: pd.DataFrame):
-    """Grafica cantidad de puntos por clasificacion."""
-    counts = df["CBL_clasificacion"].value_counts().reset_index()
-    counts.columns = ["Clasificacion", "Puntos"]
+def cylinder_surface(radius, z_values, n_theta=72, color_value=None):
+    theta = np.linspace(0, 2 * np.pi, n_theta)
+    z = np.asarray(z_values)
+    theta_grid, z_grid = np.meshgrid(theta, z)
+    x = radius * np.cos(theta_grid)
+    y = radius * np.sin(theta_grid)
+    if color_value is None:
+        color_value = np.zeros_like(z_grid)
+    return x, y, z_grid, color_value
+
+
+def make_3d_cement_model(df, bad_lim, critical_lim, max_points=700, sector_mode=False, sector_degrees=90):
+    plot_df = df[["DEPTH", "CBL"]].dropna().copy()
+    if len(plot_df) > max_points:
+        idx = np.linspace(0, len(plot_df) - 1, max_points).astype(int)
+        plot_df = plot_df.iloc[idx].copy()
+
+    depth = plot_df["DEPTH"].to_numpy()
+    cbl = plot_df["CBL"].to_numpy()
+    severity = severity_from_cbl(cbl, bad_lim, critical_lim)
+
+    n_theta = 96
+    theta = np.linspace(0, 2 * np.pi, n_theta)
+    theta_grid, z_grid = np.meshgrid(theta, depth)
+
+    # Geometría esquemática. No representa pulgadas reales, sino capas relativas.
+    casing_radius = 0.62
+    cement_radius_base = 1.00
+    formation_radius = 1.18
+
+    # El radio externo se abre más donde la adherencia es peor para que la zona crítica se vea como banda o canal.
+    if sector_mode:
+        sector_width = np.deg2rad(max(15, min(180, sector_degrees)))
+        center = np.deg2rad(40)
+        angular_distance = np.angle(np.exp(1j * (theta_grid - center)))
+        angular_weight = np.exp(-(angular_distance ** 2) / (2 * (sector_width / 2.355) ** 2))
+        sev_matrix = severity[:, None] * angular_weight
+    else:
+        sev_matrix = np.repeat(severity[:, None], n_theta, axis=1)
+
+    cement_radius = cement_radius_base + 0.32 * sev_matrix
+    x_cement = cement_radius * np.cos(theta_grid)
+    y_cement = cement_radius * np.sin(theta_grid)
+
+    x_pipe, y_pipe, z_pipe, c_pipe = cylinder_surface(casing_radius, depth, n_theta=n_theta, color_value=np.zeros_like(z_grid))
+    x_form, y_form, z_form, c_form = cylinder_surface(formation_radius, depth, n_theta=n_theta, color_value=np.zeros_like(z_grid))
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=counts["Clasificacion"],
-            y=counts["Puntos"],
-            text=counts["Puntos"],
-            textposition="auto",
-        )
-    )
+
+    fig.add_trace(go.Surface(
+        x=x_form,
+        y=y_form,
+        z=z_form,
+        surfacecolor=c_form,
+        colorscale=[[0, "#d9d9d9"], [1, "#d9d9d9"]],
+        opacity=0.12,
+        showscale=False,
+        name="Formación",
+        hoverinfo="skip",
+    ))
+
+    fig.add_trace(go.Surface(
+        x=x_pipe,
+        y=y_pipe,
+        z=z_pipe,
+        surfacecolor=c_pipe,
+        colorscale=[[0, "#3a3a3a"], [1, "#3a3a3a"]],
+        opacity=0.45,
+        showscale=False,
+        name="Casing",
+        hoverinfo="skip",
+    ))
+
+    colorscale = [
+        [0.00, "#1f78b4"],
+        [0.35, "#35a853"],
+        [0.55, "#f2c94c"],
+        [0.75, "#f2994a"],
+        [1.00, "#d7191c"],
+    ]
+
+    fig.add_trace(go.Surface(
+        x=x_cement,
+        y=y_cement,
+        z=z_grid,
+        surfacecolor=sev_matrix,
+        cmin=0,
+        cmax=1,
+        colorscale=colorscale,
+        colorbar=dict(title="Severidad CBL", len=0.72),
+        opacity=0.92,
+        name="Cemento interpretado",
+        customdata=np.repeat(cbl[:, None], n_theta, axis=1),
+        hovertemplate="Profundidad: %{z:.2f} ft<br>CBL: %{customdata:.2f} mV<br>Severidad: %{surfacecolor:.2f}<extra></extra>",
+    ))
+
     fig.update_layout(
-        title="Distribución de puntos por clasificación CBL",
-        xaxis_title="Clasificación",
-        yaxis_title="Cantidad de puntos",
-        height=420,
+        height=850,
+        scene=dict(
+            xaxis=dict(title="X", showbackground=False),
+            yaxis=dict(title="Y", showbackground=False),
+            zaxis=dict(title="Profundidad, ft", autorange="reversed"),
+            aspectmode="manual",
+            aspectratio=dict(x=1, y=1, z=3.2),
+            camera=dict(eye=dict(x=1.8, y=1.8, z=1.1)),
+        ),
+        margin=dict(l=0, r=0, t=30, b=0),
     )
     return fig
 
 
-# =========================================================
-# INTERFAZ PRINCIPAL
-# =========================================================
-st.title("🛢️ Visualizador CBL - Registro de Cemento")
-st.caption("Carga un archivo .LAS, .CSV o .XLSX para revisar amplitud CBL, intervalos sospechosos y vista pseudo 3D.")
+def make_summary_table(good_lim, regular_lim, bad_lim, critical_lim, min_len_ft):
+    return pd.DataFrame([
+        {"Rango CBL": f"≤ {good_lim:g} mV", "Condición": "Bueno", "Uso en la app": "Cemento con buena adherencia relativa casing cemento."},
+        {"Rango CBL": f"> {good_lim:g} y ≤ {regular_lim:g} mV", "Condición": "Regular", "Uso en la app": "Zona a observar, no necesariamente problema operativo."},
+        {"Rango CBL": f"> {regular_lim:g} y < {bad_lim:g} mV", "Condición": "Alerta", "Uso en la app": "Posible pérdida parcial de adherencia."},
+        {"Rango CBL": f"≥ {bad_lim:g} y < {critical_lim:g} mV", "Condición": "Mala adherencia", "Uso en la app": "Zona sospechosa de mal acoplamiento casing cemento."},
+        {"Rango CBL": f"≥ {critical_lim:g} mV", "Condición": "Crítico", "Uso en la app": "Alta amplitud, posible free pipe o muy pobre adherencia."},
+        {"Rango CBL": f"Longitud ≥ {min_len_ft:g} ft", "Condición": "Criterio operativo", "Uso en la app": "Separa eventos puntuales de intervalos relevantes."},
+    ])
 
-with st.expander("📌 ¿Qué hace esta aplicación?", expanded=True):
+
+# ------------------------------------------------------------
+# Interfaz
+# ------------------------------------------------------------
+
+st.title("Visualizador CBL con esquema 2D y modelo 3D interpretativo")
+st.caption("Carga LAS, XLSX, XLS o CSV. La app interpreta amplitud CBL y genera una representación esquemática del casing, cemento y formación.")
+
+with st.expander("Qué mide CBL y qué aporta VDL", expanded=True):
     st.markdown(
         """
-        Esta aplicación permite revisar el **registro de cemento CBL** usando la curva de amplitud.
-        La interpretación se basa en que una amplitud baja suele asociarse a mejor acoplamiento casing-cemento-formación,
-        mientras que una amplitud alta puede indicar pobre adherencia, canalización, cemento deficiente o tendencia a free pipe.
+        **CBL** trabaja principalmente con la amplitud de la señal acústica recibida. Cuando la amplitud es baja, normalmente hay mejor acoplamiento entre casing y cemento. Cuando la amplitud es alta, puede indicar mala adherencia, pobre cemento o condición cercana a free pipe.
 
-        La gráfica 3D es una **vista pseudo 3D**: proyecta la severidad del CBL alrededor de un cilindro que representa el casing.
-        No muestra azimut real porque el archivo CBL convencional no trae orientación radial. Por eso, la gráfica sirve para ubicar
-        **profundidades críticas**, no para decir en qué lado exacto del casing está el problema.
+        **VDL** no es simplemente otra curva de amplitud. Es la imagen del tren de onda acústico por profundidad y tiempo. Ayuda a diferenciar señales de casing, cemento y formación. Por eso se usa para evaluar cualitativamente si hay llegada de formación, canalización o pobre acoplamiento cemento formación.
+
+        Entonces tu idea está bien encaminada, pero con una precisión: **CBL evalúa mejor la adherencia casing cemento**; **VDL ayuda a interpretar la adherencia cemento formación y la calidad global de aislamiento**, pero no la mide de forma única sin análisis de la forma de onda.
+
+        Si el LAS solo trae AMP3FT, AMP5FT, TT, GR o CCL, se puede hacer análisis CBL. Para VDL real se necesita una matriz waveform, con muchas muestras de amplitud por cada profundidad.
         """
     )
 
-st.markdown("### Constraints / límites operativos sugeridos")
+st.subheader("Constraints operativos usados por la app")
+
+col_a, col_b, col_c, col_d, col_e = st.columns(5)
+with col_a:
+    good_lim = st.number_input("Bueno hasta, mV", min_value=0.0, value=3.0, step=0.5)
+with col_b:
+    regular_lim = st.number_input("Regular hasta, mV", min_value=good_lim, value=8.0, step=0.5)
+with col_c:
+    bad_lim = st.number_input("Mala adherencia desde, mV", min_value=regular_lim, value=10.0, step=0.5)
+with col_d:
+    critical_lim = st.number_input("Crítico desde, mV", min_value=bad_lim, value=15.0, step=0.5)
+with col_e:
+    min_len_ft = st.number_input("Longitud operativa mínima, ft", min_value=0.5, value=5.0, step=0.5)
+
+st.dataframe(make_summary_table(good_lim, regular_lim, bad_lim, critical_lim, min_len_ft), use_container_width=True, hide_index=True)
+
 st.info(
-    "Estos límites son referenciales para screening operativo. Deben ajustarse con la calibración del servicio, tamaño de casing, tipo de herramienta, presión, fluido, centralización y reporte final de la compañía de registros."
+    "La gráfica 3D es interpretativa. Como el CBL convencional no trae azimut, una zona roja no indica el lado exacto del casing. "
+    "Por defecto se representa como banda de 360 grados. El modo sectorial solo es didáctico y no debe usarse como evidencia de orientación real."
 )
 
-constraints_df = pd.DataFrame(
-    [
-        {"Rango CBL": "≤ 3 mV", "Clasificación": "Bueno", "Uso operativo": "Cemento/adherencia aceptable relativa."},
-        {"Rango CBL": "> 3 y ≤ 8 mV", "Clasificación": "Regular", "Uso operativo": "Zona a observar; no concluir falla solo con este dato."},
-        {"Rango CBL": "> 8 y < 10 mV", "Clasificación": "Alerta", "Uso operativo": "Posible pérdida parcial de adherencia."},
-        {"Rango CBL": "≥ 10 mV", "Clasificación": "Mala adherencia", "Uso operativo": "Zona sospechosa; revisar continuidad y curvas auxiliares."},
-        {"Rango CBL": "≥ 15 mV", "Clasificación": "Crítico", "Uso operativo": "Alta amplitud; posible pobre adherencia severa o tendencia a free pipe."},
-        {"Rango CBL": "Longitud ≥ 5 ft", "Clasificación": "Criterio operativo", "Uso operativo": "Prioriza tramos continuos y evita sobrerreaccionar a picos aislados."},
-    ]
-)
-st.dataframe(constraints_df, use_container_width=True, hide_index=True)
-
-uploaded_file = st.file_uploader(
-    "Carga tu archivo de registro",
-    type=["las", "csv", "xlsx", "xls"],
-    help="Puede ser LAS original, CSV exportado o Excel con columnas de profundidad y amplitud CBL."
-)
+uploaded_file = st.file_uploader("Carga tu archivo LAS, XLSX, XLS o CSV", type=["las", "xlsx", "xls", "csv"])
 
 if uploaded_file is None:
-    st.warning("Carga un archivo para iniciar el análisis.")
     st.stop()
 
 try:
-    df_raw = load_uploaded_file(uploaded_file)
-except Exception as e:
-    st.error(f"No se pudo leer el archivo: {e}")
+    raw_df = load_file(uploaded_file)
+except Exception as exc:
+    st.error(f"No se pudo leer el archivo: {exc}")
     st.stop()
 
-if df_raw.empty:
-    st.error("El archivo se leyó, pero no contiene datos.")
+if raw_df.empty:
+    st.error("El archivo se leyó, pero no contiene datos tabulares.")
     st.stop()
 
-# Detectar columnas
-suggested = detect_columns(df_raw)
-columns = list(df_raw.columns)
+st.success(f"Archivo cargado: {uploaded_file.name}")
 
-st.sidebar.header("Configuración del análisis")
+with st.expander("Selección de curvas", expanded=True):
+    depth_guess = guess_depth_column(raw_df)
+    cbl_guess = guess_cbl_column(raw_df)
+    gr_guess = find_optional_column(raw_df, ["GR", "GK", "GAMMA", "GK1"])
+    ccl_guess = find_optional_column(raw_df, ["CCL"])
+    tt_guess = find_optional_column(raw_df, ["TT", "TT3FT", "TRANSIT", "TRAVEL"])
 
-def select_col(label: str, suggested_col: Optional[str], allow_none: bool = False):
-    options = ["Ninguno"] + columns if allow_none else columns
-    if suggested_col in columns:
-        index = options.index(suggested_col)
-    else:
-        index = 0
-    selected = st.sidebar.selectbox(label, options, index=index)
-    if selected == "Ninguno":
-        return None
-    return selected
+    columns = list(raw_df.columns)
+    depth_col = st.selectbox("Curva de profundidad", columns, index=columns.index(depth_guess) if depth_guess in columns else 0)
+    cbl_col = st.selectbox("Curva CBL o amplitud", columns, index=columns.index(cbl_guess) if cbl_guess in columns else 0)
 
-# Si no detecta, toma primera columna para profundidad y segunda para CBL como respaldo
-if suggested["depth"] is None and len(columns) > 0:
-    suggested["depth"] = columns[0]
-if suggested["amp3"] is None and len(columns) > 1:
-    suggested["amp3"] = columns[1]
+    optional = ["Ninguna"] + columns
+    gr_col = st.selectbox("Gamma Ray, opcional", optional, index=optional.index(gr_guess) if gr_guess in optional else 0)
+    tt_col = st.selectbox("Travel Time, opcional", optional, index=optional.index(tt_guess) if tt_guess in optional else 0)
+    ccl_col = st.selectbox("CCL, opcional", optional, index=optional.index(ccl_guess) if ccl_guess in optional else 0)
 
-depth_col = select_col("Columna de profundidad", suggested["depth"], allow_none=False)
-cbl_col = select_col("Columna CBL principal", suggested["amp3"], allow_none=False)
-gr_col = select_col("Columna GR / GK", suggested["gr"], allow_none=True)
-amp5_col = select_col("Columna AMP5FT / secundaria", suggested["amp5"], allow_none=True)
-tt_col = select_col("Columna TT / Travel Time", suggested["tt"], allow_none=True)
-ccl_col = select_col("Columna CCL", suggested["ccl"], allow_none=True)
-
-st.sidebar.subheader("Constraints CBL")
-good_max = st.sidebar.number_input("Bueno hasta, mV", value=3.0, step=0.5)
-regular_max = st.sidebar.number_input("Regular hasta, mV", value=8.0, step=0.5)
-alert_max = st.sidebar.number_input("Alerta hasta, mV", value=10.0, step=0.5)
-bad_min = st.sidebar.number_input("Mala adherencia desde, mV", value=10.0, step=0.5)
-critical_min = st.sidebar.number_input("Crítico desde, mV", value=15.0, step=0.5)
-min_length_ft = st.sidebar.number_input("Longitud mínima operativa, ft", value=5.0, min_value=0.0, step=0.5)
-
-st.sidebar.subheader("Filtro de profundidad")
+    gr_col = None if gr_col == "Ninguna" else gr_col
+    tt_col = None if tt_col == "Ninguna" else tt_col
+    ccl_col = None if ccl_col == "Ninguna" else ccl_col
 
 try:
-    temp_depth = pd.to_numeric(df_raw[depth_col], errors="coerce").dropna()
-except Exception:
-    st.error("La columna de profundidad seleccionada no se puede convertir a número.")
+    df = clean_data(raw_df, depth_col, cbl_col, gr_col=gr_col, ccl_col=ccl_col, tt_col=tt_col)
+except Exception as exc:
+    st.error(f"No se pudo preparar la información: {exc}")
     st.stop()
 
-if temp_depth.empty:
-    st.error("No hay valores numéricos válidos en la columna de profundidad.")
+if len(df) < 3:
+    st.error("Hay muy pocos puntos válidos para graficar.")
     st.stop()
 
-min_depth = float(temp_depth.min())
-max_depth = float(temp_depth.max())
-selected_depth_range = st.sidebar.slider(
-    "Intervalo de profundidad, ft",
-    min_value=min_depth,
-    max_value=max_depth,
-    value=(min_depth, max_depth),
-)
-
-# Preparar datos
-try:
-    df = prepare_cbl_dataframe(
-        df_raw,
-        depth_col=depth_col,
-        cbl_col=cbl_col,
-        good_max=good_max,
-        regular_max=regular_max,
-        alert_max=alert_max,
-        bad_min=bad_min,
-        critical_min=critical_min,
-    )
-except Exception as e:
-    st.error(f"Error preparando los datos: {e}")
-    st.stop()
-
-df = df[(df[depth_col] >= selected_depth_range[0]) & (df[depth_col] <= selected_depth_range[1])].copy()
-
-if df.empty:
-    st.error("No hay datos dentro del intervalo de profundidad seleccionado.")
-    st.stop()
-
-# Convertir opcionales a numerico cuando existan
-for optional_col in [gr_col, amp5_col, tt_col, ccl_col]:
-    if optional_col and optional_col in df.columns:
-        df[optional_col] = pd.to_numeric(df[optional_col], errors="coerce")
+# Clasificación
+df["CLASS"] = df["CBL"].apply(lambda x: classify_cbl(x, good_lim, regular_lim, bad_lim, critical_lim))
+df["SEVERITY"] = severity_from_cbl(df["CBL"].to_numpy(), bad_lim, critical_lim)
 
 # Métricas principales
-bad_intervals = find_bad_bond_intervals(
-    df,
-    depth_col=depth_col,
-    cbl_col=cbl_col,
-    threshold=bad_min,
-    min_length_ft=min_length_ft,
-)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Desde ft", f"{df['DEPTH'].min():.2f}")
+m2.metric("Hasta ft", f"{df['DEPTH'].max():.2f}")
+m3.metric("CBL máximo mV", f"{df['CBL'].max():.2f}")
+m4.metric("Puntos analizados", f"{len(df):,}")
 
-critical_intervals = find_bad_bond_intervals(
-    df,
-    depth_col=depth_col,
-    cbl_col=cbl_col,
-    threshold=critical_min,
-    min_length_ft=0.5,
-)
+intervals = detect_intervals(df, bad_lim, min_len_ft)
+operational = intervals[intervals["Condición"] == "Operativo"] if not intervals.empty else pd.DataFrame()
+short_events = intervals[intervals["Condición"] == "Evento corto"] if not intervals.empty else pd.DataFrame()
 
-st.markdown("---")
-st.subheader("Resumen rápido del archivo")
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Profundidad mínima", f"{df[depth_col].min():.2f} ft")
-with col2:
-    st.metric("Profundidad máxima", f"{df[depth_col].max():.2f} ft")
-with col3:
-    st.metric("CBL máximo", f"{df[cbl_col].max():.2f} mV")
-with col4:
-    st.metric("Intervalos operativos malos", len(bad_intervals))
-
-if not bad_intervals.empty:
-    main_interval = bad_intervals.iloc[0]
-    st.success(
-        f"Principal intervalo sospechoso: {main_interval['Desde_ft']:.2f} - {main_interval['Hasta_ft']:.2f} ft "
-        f"| Longitud: {main_interval['Longitud_ft']:.2f} ft "
-        f"| CBL máx: {main_interval['CBL_max_mV']:.2f} mV"
-    )
+st.subheader("Resultado interpretativo")
+if not operational.empty:
+    st.warning("Se encontraron intervalos operativos con posible mala adherencia.")
+    st.dataframe(operational, use_container_width=True, hide_index=True)
 else:
-    st.warning("No se encontraron intervalos continuos que superen el umbral operativo configurado.")
+    st.info("No se encontraron intervalos continuos que superen el criterio operativo de mala adherencia.")
 
-# Tabs de visualización
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Registro 2D",
-    "🧱 Vista pseudo 3D",
-    "📍 Intervalos",
-    "📊 Clasificación",
-    "🧾 Datos",
-])
+if not short_events.empty:
+    with st.expander("Eventos cortos o puntuales"):
+        st.dataframe(short_events, use_container_width=True, hide_index=True)
 
-with tab1:
-    st.markdown(
-        """
-        Esta vista permite comparar el CBL principal con curvas auxiliares como GR, AMP5FT, TT y CCL.
-        Para interpretación operativa, no se recomienda usar solo un pico aislado de amplitud; debe revisarse continuidad,
-        coherencia con otras curvas y contexto mecánico del pozo.
-        """
-    )
-    fig_2d = make_2d_tracks(df, depth_col, cbl_col, gr_col, amp5_col, tt_col, ccl_col, bad_min, critical_min)
-    st.plotly_chart(fig_2d, use_container_width=True)
+st.subheader("Vista tipo log")
+st.plotly_chart(make_log_plot(df, good_lim, regular_lim, bad_lim, critical_lim), use_container_width=True)
 
-with tab2:
-    st.markdown(
-        """
-        La pseudo 3D muestra el casing como un cilindro. El color representa la amplitud CBL en cada profundidad.
-        Como el registro no trae información azimutal, la severidad se replica alrededor de todo el cilindro.
-        Por eso esta gráfica responde principalmente: **¿a qué profundidad hay mayor sospecha de mala adherencia?**
-        """
-    )
-    fig_3d = make_cbl_3d_cylinder(df, depth_col, cbl_col, bad_min, critical_min)
-    st.plotly_chart(fig_3d, use_container_width=True)
+st.subheader("Esquema 2D tipo casing cemento formación")
+st.caption("Este esquema convierte la amplitud CBL en severidad visual. No reemplaza la interpretación oficial del registro.")
+st.plotly_chart(make_2d_schematic(df, good_lim, regular_lim, bad_lim, critical_lim), use_container_width=True)
 
-with tab3:
-    st.markdown("### Intervalos con mala adherencia según el umbral operativo")
-    st.caption(f"Criterio actual: {cbl_col} ≥ {bad_min} mV y longitud ≥ {min_length_ft} ft")
-    if bad_intervals.empty:
-        st.info("No hay intervalos operativos con los criterios actuales.")
-    else:
-        st.dataframe(bad_intervals, use_container_width=True, hide_index=True)
+st.subheader("Modelo 3D interpretativo")
+col3a, col3b, col3c = st.columns([1, 1, 1])
+with col3a:
+    max_points = st.slider("Puntos máximos para 3D", min_value=200, max_value=1500, value=700, step=100)
+with col3b:
+    sector_mode = st.checkbox("Mostrar sector didáctico", value=False)
+with col3c:
+    sector_degrees = st.slider("Apertura del sector didáctico", min_value=30, max_value=180, value=90, step=15)
 
-    st.markdown("### Eventos críticos cortos")
-    st.caption(f"Criterio actual: {cbl_col} ≥ {critical_min} mV y longitud mínima 0.5 ft")
-    if critical_intervals.empty:
-        st.info("No hay eventos críticos con los criterios actuales.")
-    else:
-        st.dataframe(critical_intervals, use_container_width=True, hide_index=True)
+st.plotly_chart(make_3d_cement_model(df, bad_lim, critical_lim, max_points=max_points, sector_mode=sector_mode, sector_degrees=sector_degrees), use_container_width=True)
 
-with tab4:
-    fig_dist = make_class_distribution(df)
-    st.plotly_chart(fig_dist, use_container_width=True)
-
-    class_table = df["CBL_clasificacion"].value_counts().rename_axis("Clasificacion").reset_index(name="Puntos")
-    st.dataframe(class_table, use_container_width=True, hide_index=True)
-
-with tab5:
-    st.markdown("### Datos procesados")
+st.subheader("Datos procesados")
+with st.expander("Ver tabla completa"):
     st.dataframe(df, use_container_width=True)
 
-    csv_export = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Descargar datos procesados en CSV",
-        data=csv_export,
-        file_name="cbl_datos_procesados.csv",
-        mime="text/csv",
-    )
+csv = df.to_csv(index=False).encode("utf-8")
+st.download_button("Descargar datos procesados CSV", csv, file_name="cbl_datos_procesados.csv", mime="text/csv")
 
-st.markdown("---")
-st.caption(
-    "Nota: Este visualizador es para screening técnico. Para decisiones de cementación, aislamiento o workover, validar con el reporte oficial, calibración de herramienta, condiciones de pozo, centralización, presión, fluido y registros complementarios."
-)
+if not intervals.empty:
+    csv_int = intervals.to_csv(index=False).encode("utf-8")
+    st.download_button("Descargar intervalos interpretados CSV", csv_int, file_name="cbl_intervalos_interpretados.csv", mime="text/csv")
