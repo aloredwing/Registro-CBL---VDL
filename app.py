@@ -326,53 +326,51 @@ def make_log_plot(df, good_lim, regular_lim, bad_lim, critical_lim):
 
 
 def make_2d_annulus_schematic(df, good_lim, bad_lim, critical_lim, vdl_interp=None):
+    """
+    Esquema 2D simple:
+    - casing/tubular en negro
+    - cemento en plomo
+    - blanco donde el CBL sugiere pobre adherencia o ausencia visual de cemento
+
+    Nota: la zona blanca es una representación interpretativa, no una medición directa
+    de volumen real de cemento.
+    """
     plot_df = df.copy()
     z = plot_df["DEPTH"].to_numpy()
     cbl = plot_df["CBL"].to_numpy()
-    severity = severity_from_cbl(cbl, bad_lim, critical_lim)
     coverage = cement_coverage_from_cbl(cbl, good_lim, critical_lim)
 
-    # x esquemático: casing, línea invisible, cemento y VDL externo.
-    x = np.linspace(-1.75, 1.75, 140)
-    image = np.full((len(z), len(x)), np.nan)
+    # Eje esquemático radial. No representa diámetro real del pozo.
+    x = np.linspace(-1.30, 1.30, 180)
+    image = np.full((len(z), len(x)), np.nan)  # NaN se verá blanco
 
     casing_r = 0.30
     interface_r = 0.42
-    max_cement_r = 1.02
-    vdl_inner_r = 1.12
-    vdl_outer_r = 1.48
+    max_cement_r = 1.05
 
-    for i, (sev, cov) in enumerate(zip(severity, coverage)):
-        # Menor cobertura CBL = menor espesor visual de cemento plomo.
-        cement_outer = interface_r + cov * (max_cement_r - interface_r)
+    for i, cov in enumerate(coverage):
+        # Si la cobertura visual es muy baja, se deja el anular en blanco.
+        if cov < 0.08:
+            cement_outer = interface_r
+        else:
+            cement_outer = interface_r + cov * (max_cement_r - interface_r)
+
         for j, xx in enumerate(x):
             ax = abs(xx)
             if ax <= casing_r:
-                image[i, j] = -0.55              # casing
+                image[i, j] = 0.0       # tubular negro
             elif casing_r < ax <= interface_r:
-                image[i, j] = -0.10              # espacio / línea invisible
+                image[i, j] = np.nan    # separación visual casi invisible
             elif interface_r < ax <= cement_outer:
-                image[i, j] = 0.35 + 0.35 * cov  # cemento plomo
-            elif cement_outer < ax <= max_cement_r:
-                image[i, j] = 0.10 + 0.20 * sev  # bajo cemento / vacío visual
-            elif vdl_inner_r <= ax <= vdl_outer_r:
-                if vdl_interp is None or np.isnan(vdl_interp[i]):
-                    image[i, j] = 0.02            # VDL pendiente
-                else:
-                    image[i, j] = 0.75 + 0.25 * vdl_interp[i]
+                image[i, j] = 0.70      # cemento plomo
+            else:
+                image[i, j] = np.nan    # falta visual de cemento
 
     colorscale = [
-        [0.00, "#222222"],
-        [0.18, "#222222"],
-        [0.19, "#ffffff"],
-        [0.33, "#ffffff"],
-        [0.34, "#f7f7f7"],
-        [0.47, "#f7f7f7"],
-        [0.48, "#d9d9d9"],
-        [0.68, "#9e9e9e"],
-        [0.69, "#c7d8ff"],
-        [0.84, "#5b8def"],
-        [1.00, "#3f1dcb"],
+        [0.00, "#1f1f1f"],
+        [0.20, "#1f1f1f"],
+        [0.21, "#bdbdbd"],
+        [1.00, "#8f8f8f"],
     ]
 
     fig = make_subplots(
@@ -381,45 +379,53 @@ def make_2d_annulus_schematic(df, good_lim, bad_lim, critical_lim, vdl_interp=No
         column_widths=[0.58, 0.42],
         shared_yaxes=True,
         horizontal_spacing=0.03,
-        subplot_titles=["Esquema casing cemento VDL", "Curva CBL"],
+        subplot_titles=["Esquema 2D: tubular y cemento", "Curva CBL"],
     )
 
     fig.add_trace(go.Heatmap(
         x=x,
         y=z,
         z=image,
-        zmin=-0.55,
-        zmax=1.0,
+        zmin=0,
+        zmax=1,
         colorscale=colorscale,
         showscale=False,
         hovertemplate="Profundidad: %{y:.2f} ft<extra></extra>",
     ), row=1, col=1)
 
-    # Líneas de referencia.
+    # Bordes del tubular y límites de referencia del cemento esperado.
     for xline, color, width, dash in [
         (-casing_r, "black", 3, "solid"),
         (casing_r, "black", 3, "solid"),
         (-interface_r, "rgba(0,0,0,0.18)", 1, "dot"),
         (interface_r, "rgba(0,0,0,0.18)", 1, "dot"),
-        (-max_cement_r, "gray", 1, "dash"),
-        (max_cement_r, "gray", 1, "dash"),
-        (-vdl_inner_r, "#5b8def", 1, "dot"),
-        (vdl_inner_r, "#5b8def", 1, "dot"),
-        (-vdl_outer_r, "#5b8def", 1, "dash"),
-        (vdl_outer_r, "#5b8def", 1, "dash"),
+        (-max_cement_r, "rgba(90,90,90,0.45)", 1, "dash"),
+        (max_cement_r, "rgba(90,90,90,0.45)", 1, "dash"),
     ]:
         fig.add_vline(x=xline, line_width=width, line_dash=dash, line_color=color, row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=cbl, y=z, mode="lines", name="CBL"), row=1, col=2)
+    fig.add_trace(go.Scatter(
+        x=cbl,
+        y=z,
+        mode="lines",
+        name="CBL",
+        line=dict(color="#3a3a3a", width=1.5),
+    ), row=1, col=2)
+
     for xline, label in [(bad_lim, "Mala adherencia"), (critical_lim, "Crítico")]:
-        fig.add_vline(x=xline, line_width=1, line_dash="dash", annotation_text=label, row=1, col=2)
+        fig.add_vline(x=xline, line_width=1, line_dash="dash", line_color="black", annotation_text=label, row=1, col=2)
 
     fig.update_yaxes(autorange="reversed", title_text="Profundidad, ft")
     fig.update_xaxes(showticklabels=False, row=1, col=1)
     fig.update_xaxes(title_text="CBL, mV", row=1, col=2)
-    fig.update_layout(height=850, margin=dict(l=20, r=20, t=70, b=20), showlegend=False)
+    fig.update_layout(
+        height=850,
+        margin=dict(l=20, r=20, t=70, b=20),
+        showlegend=False,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
     return fig
-
 
 # ============================================================
 # Modelo 3D tubular
@@ -465,7 +471,16 @@ def make_3d_tubular_model(
     sector_mode=False,
     sector_degrees=90,
     show_reference_rings=True,
+    missing_cutoff=0.12,
 ):
+    """
+    Modelo 3D interpretativo:
+    - tubular/casing negro al centro
+    - cemento plomo alrededor del tubular
+    - envolvente punteada indica hasta dónde debería llegar el cemento completo
+    - donde el CBL aumenta, el cemento plomo se reduce o desaparece
+    - sin anillos rojos: la falta se interpreta por ausencia de plomo
+    """
     plot_df = df[["DEPTH", "CBL"]].dropna().copy()
     if len(plot_df) > max_points:
         idx = np.linspace(0, len(plot_df) - 1, max_points).astype(int)
@@ -475,34 +490,39 @@ def make_3d_tubular_model(
 
     depth = plot_df["DEPTH"].to_numpy(dtype=float)
     cbl = plot_df["CBL"].to_numpy(dtype=float)
-    severity = severity_from_cbl(cbl, bad_lim, critical_lim)
     coverage = cement_coverage_from_cbl(cbl, good_lim, critical_lim)
 
-    n_theta = 112
+    n_theta = 128
     casing_r = 0.50
-    interface_r = 0.64        # línea invisible casing cemento
-    cement_outer_max = 1.08   # cemento completo
-    vdl_r = 1.34              # capa externa VDL
-    formation_r = 1.55        # formación referencial
+    interface_r = 0.63         # interfaz casing cemento, casi invisible
+    cement_outer_max = 1.12    # límite externo esperado del cemento
+    vdl_r = 1.38               # capa externa opcional VDL
+    formation_r = 1.58         # formación referencial muy tenue
 
     theta = np.linspace(0, 2 * np.pi, n_theta)
     theta_grid, z_grid = np.meshgrid(theta, depth)
 
     if sector_mode:
+        # Didáctico: crea una ventana lateral para ver el concepto de falta de cemento.
+        # No es azimut real, porque el CBL convencional no trae orientación radial.
         sector_width = np.deg2rad(max(15, min(180, sector_degrees)))
-        center = np.deg2rad(40)
+        center = np.deg2rad(35)
         angular_distance = np.angle(np.exp(1j * (theta_grid - center)))
         angular_weight = np.exp(-(angular_distance ** 2) / (2 * (sector_width / 2.355) ** 2))
-        local_severity = severity[:, None] * angular_weight
-        local_coverage = np.clip(1 - local_severity, 0, 1)
+        missing_fraction = (1 - coverage)[:, None] * angular_weight
+        local_coverage = np.clip(1 - missing_fraction, 0, 1)
     else:
-        local_severity = np.repeat(severity[:, None], n_theta, axis=1)
+        # Interpretación conservadora sin azimut: el cambio aplica alrededor de todo el casing.
         local_coverage = np.repeat(coverage[:, None], n_theta, axis=1)
 
-    # Cemento: donde hay buena adherencia se ve más espeso y plomo.
     cement_radius = interface_r + local_coverage * (cement_outer_max - interface_r)
-    x_cement = cement_radius * np.cos(theta_grid)
-    y_cement = cement_radius * np.sin(theta_grid)
+
+    # Si la cobertura visual cae por debajo del corte, se deja en blanco/transparente.
+    visible_mask = local_coverage >= missing_cutoff
+    x_cement = np.where(visible_mask, cement_radius * np.cos(theta_grid), np.nan)
+    y_cement = np.where(visible_mask, cement_radius * np.sin(theta_grid), np.nan)
+    z_cement = np.where(visible_mask, z_grid, np.nan)
+    cement_color = np.where(visible_mask, local_coverage, np.nan)
 
     x_pipe, y_pipe, z_pipe, _ = cylinder_grid(casing_r, depth, n_theta)
     x_interface, y_interface, z_interface, _ = cylinder_grid(interface_r, depth, n_theta)
@@ -510,34 +530,21 @@ def make_3d_tubular_model(
 
     fig = go.Figure()
 
-    # Formación referencial externa.
+    # Formación referencial externa, muy tenue.
     fig.add_trace(go.Surface(
         x=x_form,
         y=y_form,
         z=z_form,
         surfacecolor=np.zeros_like(z_form),
         colorscale=[[0, "#eeeeee"], [1, "#eeeeee"]],
-        opacity=0.07,
+        opacity=0.045,
         showscale=False,
         name="Formación referencial",
         hoverinfo="skip",
     ))
 
-    # Capa VDL externa, pendiente o interpretada si se carga waveform.
-    if vdl_interp is None:
-        x_vdl, y_vdl, z_vdl, _ = cylinder_grid(vdl_r, depth, n_theta)
-        fig.add_trace(go.Surface(
-            x=x_vdl,
-            y=y_vdl,
-            z=z_vdl,
-            surfacecolor=np.zeros_like(z_vdl),
-            colorscale=[[0, "#c7d8ff"], [1, "#c7d8ff"]],
-            opacity=0.10,
-            showscale=False,
-            name="VDL pendiente",
-            hovertemplate="Profundidad: %{z:.2f} ft<br>VDL: pendiente<extra></extra>",
-        ))
-    else:
+    # Capa VDL: si no hay VDL, solo queda un espacio externo muy tenue.
+    if vdl_interp is not None:
         vdl_vals = np.asarray(vdl_interp, dtype=float)
         vdl_vals = np.where(np.isnan(vdl_vals), 0.0, vdl_vals)
         vdl_surface = np.repeat(vdl_vals[:, None], n_theta, axis=1)
@@ -549,89 +556,101 @@ def make_3d_tubular_model(
             surfacecolor=vdl_surface,
             cmin=0,
             cmax=1,
-            colorscale=[[0, "#eaf0ff"], [0.5, "#5b8def"], [1, "#3f1dcb"]],
-            opacity=0.38,
-            colorbar=dict(title="VDL índice", len=0.45, y=0.25),
+            colorscale=[[0, "#f2f5ff"], [0.50, "#9db8ff"], [1, "#496bd6"]],
+            opacity=0.25,
+            colorbar=dict(title="VDL", len=0.34, y=0.24),
             name="Capa VDL",
             customdata=vdl_surface,
             hovertemplate="Profundidad: %{z:.2f} ft<br>VDL índice: %{customdata:.2f}<extra></extra>",
         ))
 
-    # Línea invisible de referencia casing cemento.
+    # Interfaz casing cemento casi invisible.
     fig.add_trace(go.Surface(
         x=x_interface,
         y=y_interface,
         z=z_interface,
         surfacecolor=np.zeros_like(z_interface),
         colorscale=[[0, "#ffffff"], [1, "#ffffff"]],
-        opacity=0.035,
+        opacity=0.025,
         showscale=False,
         name="Interfaz casing cemento",
         hoverinfo="skip",
     ))
 
-    # Casing / tubular.
+    # Cemento plomo real interpretado por CBL.
+    cbl_grid = np.repeat(cbl[:, None], n_theta, axis=1)
+    customdata = np.stack((cbl_grid, local_coverage * 100), axis=-1)
+    fig.add_trace(go.Surface(
+        x=x_cement,
+        y=y_cement,
+        z=z_cement,
+        surfacecolor=cement_color,
+        cmin=0,
+        cmax=1,
+        colorscale=[[0, "#eeeeee"], [0.45, "#c4c4c4"], [1, "#7f7f7f"]],
+        opacity=0.86,
+        colorbar=dict(title="Cemento", len=0.38, y=0.78),
+        name="Cemento plomo por CBL",
+        customdata=customdata,
+        hovertemplate=(
+            "Profundidad: %{z:.2f} ft<br>"
+            "CBL: %{customdata[0]:.2f} mV<br>"
+            "Cemento visual: %{customdata[1]:.0f}%<extra></extra>"
+        ),
+    ))
+
+    # Tubular/casing al centro. Se dibuja después para que sea visible en ventanas sin cemento.
     fig.add_trace(go.Surface(
         x=x_pipe,
         y=y_pipe,
         z=z_pipe,
         surfacecolor=np.zeros_like(z_pipe),
-        colorscale=[[0, "#2b2b2b"], [1, "#2b2b2b"]],
-        opacity=0.72,
+        colorscale=[[0, "#202020"], [1, "#202020"]],
+        opacity=0.82,
         showscale=False,
         name="Tubular casing",
         hoverinfo="skip",
     ))
 
-    # Cemento plomo. Menor cobertura = radio menor y tono más claro.
-    fig.add_trace(go.Surface(
-        x=x_cement,
-        y=y_cement,
-        z=z_grid,
-        surfacecolor=local_coverage,
-        cmin=0,
-        cmax=1,
-        colorscale=[[0, "#f7f7f7"], [0.45, "#cfcfcf"], [1, "#8f8f8f"]],
-        opacity=0.88,
-        colorbar=dict(title="Cobertura cemento", len=0.45, y=0.77),
-        name="Cemento interpretado por CBL",
-        customdata=np.repeat(cbl[:, None], n_theta, axis=1),
-        hovertemplate=(
-            "Profundidad: %{z:.2f} ft<br>"
-            "CBL: %{customdata:.2f} mV<br>"
-            "Cobertura cemento: %{surfacecolor:.2f}<extra></extra>"
-        ),
-    ))
-
-    # Anillos rojos en los intervalos con CBL crítico o mala adherencia, solo como guía visual.
-    bad_depths = depth[cbl >= bad_lim]
-    if len(bad_depths) > 0:
-        # Reducimos cantidad de anillos para no saturar.
-        step = max(1, int(len(bad_depths) / 80))
-        for z in bad_depths[::step]:
-            fig.add_trace(ring_line(cement_outer_max + 0.015, z, color="rgba(215,25,28,0.40)", width=2, name="bad ring"))
-
+    # Envolvente del cemento esperado. Esto permite ver rápido dónde falta plomo.
     if show_reference_rings and len(depth) > 0:
-        for z in [float(np.nanmin(depth)), float(np.nanmax(depth))]:
-            fig.add_trace(ring_line(casing_r, z, color="black", width=4, name="casing ring"))
-            fig.add_trace(ring_line(cement_outer_max, z, color="gray", width=2, name="cement ring"))
-            fig.add_trace(ring_line(vdl_r, z, color="rgba(91,141,239,0.75)", width=2, name="vdl ring"))
+        z_min = float(np.nanmin(depth))
+        z_max = float(np.nanmax(depth))
+        z_lines = np.linspace(z_min, z_max, 9)
+        for zz in z_lines:
+            fig.add_trace(ring_line(cement_outer_max, zz, color="rgba(90,90,90,0.28)", width=2, name="cement reference"))
+        for angle in np.linspace(0, 2 * np.pi, 10, endpoint=False):
+            fig.add_trace(go.Scatter3d(
+                x=np.full_like(depth, cement_outer_max * np.cos(angle)),
+                y=np.full_like(depth, cement_outer_max * np.sin(angle)),
+                z=depth,
+                mode="lines",
+                line=dict(color="rgba(90,90,90,0.20)", width=1),
+                name="Límite cemento esperado",
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+        # Contorno VDL pendiente, muy suave.
+        fig.add_trace(ring_line(vdl_r, z_min, color="rgba(120,145,220,0.22)", width=2, name="vdl top"))
+        fig.add_trace(ring_line(vdl_r, z_max, color="rgba(120,145,220,0.22)", width=2, name="vdl bottom"))
+        fig.add_trace(ring_line(casing_r, z_min, color="black", width=4, name="casing top"))
+        fig.add_trace(ring_line(casing_r, z_max, color="black", width=4, name="casing bottom"))
 
     fig.update_layout(
         height=880,
         scene=dict(
-            xaxis=dict(title="X", showbackground=False, visible=True),
-            yaxis=dict(title="Y", showbackground=False, visible=True),
+            xaxis=dict(title="X", showbackground=False, visible=True, range=[-1.75, 1.75]),
+            yaxis=dict(title="Y", showbackground=False, visible=True, range=[-1.75, 1.75]),
             zaxis=dict(title="Profundidad, ft", autorange="reversed"),
             aspectmode="manual",
-            aspectratio=dict(x=1, y=1, z=3.6),
-            camera=dict(eye=dict(x=1.9, y=1.8, z=1.15)),
+            aspectratio=dict(x=1, y=1, z=3.8),
+            camera=dict(eye=dict(x=1.75, y=1.95, z=1.05)),
         ),
         margin=dict(l=0, r=0, t=30, b=0),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        paper_bgcolor="white",
     )
     return fig
-
 
 # ============================================================
 # Tablas
@@ -642,8 +661,8 @@ def make_summary_table(good_lim, regular_lim, bad_lim, critical_lim, min_len_ft)
         {"Rango CBL": f"≤ {good_lim:g} mV", "Condición": "Bueno", "Uso en la app": "Mayor cobertura ploma de cemento alrededor del tubular."},
         {"Rango CBL": f"> {good_lim:g} y ≤ {regular_lim:g} mV", "Condición": "Regular", "Uso en la app": "Cemento visible, pero con menor calidad relativa."},
         {"Rango CBL": f"> {regular_lim:g} y < {bad_lim:g} mV", "Condición": "Alerta", "Uso en la app": "Reduce el espesor visual del cemento."},
-        {"Rango CBL": f"≥ {bad_lim:g} y < {critical_lim:g} mV", "Condición": "Mala adherencia", "Uso en la app": "Menos cemento plomo y anillo rojo de advertencia."},
-        {"Rango CBL": f"≥ {critical_lim:g} mV", "Condición": "Crítico", "Uso en la app": "Cemento muy reducido visualmente; posible free pipe o pobre adherencia."},
+        {"Rango CBL": f"≥ {bad_lim:g} y < {critical_lim:g} mV", "Condición": "Mala adherencia", "Uso en la app": "Menos cemento plomo; las zonas deficientes quedan blancas o transparentes."},
+        {"Rango CBL": f"≥ {critical_lim:g} mV", "Condición": "Crítico", "Uso en la app": "Cemento plomo muy reducido o ausente visualmente; posible free pipe o pobre adherencia."},
         {"Rango CBL": f"Longitud ≥ {min_len_ft:g} ft", "Condición": "Criterio operativo", "Uso en la app": "Separa eventos puntuales de intervalos relevantes."},
     ])
 
@@ -800,7 +819,7 @@ st.subheader("Vista tipo log")
 st.plotly_chart(make_log_plot(df, good_lim, regular_lim, bad_lim, critical_lim), use_container_width=True)
 
 st.subheader("Esquema 2D casing cemento VDL")
-st.caption("El cemento plomo se reduce visualmente donde el CBL indica mayor amplitud. La zona azul es el espacio VDL externo; si cargas waveform se colorea con el índice VDL.")
+st.caption("El plomo representa cemento. Si el CBL indica pobre adherencia, el plomo se reduce; si la condición es crítica, la zona queda blanca. El VDL se carga aparte y no altera este esquema 2D.")
 st.plotly_chart(make_2d_annulus_schematic(df, good_lim, bad_lim, critical_lim, vdl_interp=vdl_interp), use_container_width=True)
 
 st.subheader("Modelo 3D tubular con cemento y capa VDL")
@@ -808,11 +827,13 @@ col3a, col3b, col3c, col3d = st.columns(4)
 with col3a:
     max_points = st.slider("Puntos máximos 3D", min_value=200, max_value=1500, value=700, step=100)
 with col3b:
-    sector_mode = st.checkbox("Modo sectorial didáctico", value=True)
+    sector_mode = st.checkbox("Modo sectorial didáctico", value=False)
 with col3c:
     sector_degrees = st.slider("Apertura sectorial", min_value=30, max_value=180, value=95, step=5)
 with col3d:
-    show_reference_rings = st.checkbox("Anillos de referencia", value=True)
+    show_reference_rings = st.checkbox("Envolvente esperada", value=True)
+
+missing_cutoff = st.slider("Ocultar cemento si cobertura visual es menor a", min_value=0, max_value=50, value=12, step=2, help="Mientras mayor sea este valor, más zonas quedarán en blanco/transparente cuando el CBL indique pobre adherencia.") / 100
 
 st.plotly_chart(
     make_3d_tubular_model(
@@ -825,6 +846,7 @@ st.plotly_chart(
         sector_mode=sector_mode,
         sector_degrees=sector_degrees,
         show_reference_rings=show_reference_rings,
+        missing_cutoff=missing_cutoff,
     ),
     use_container_width=True,
 )
